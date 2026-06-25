@@ -23,7 +23,9 @@
 static int read_file(const char *path, char *buf, size_t n) {
     int fd = open(path, O_RDONLY); if (fd < 0) return -1;
     ssize_t r = read(fd, buf, n - 1); close(fd);
-    if (r < 0) return -1; buf[r] = '\0'; return 0;
+    if (r < 0) return -1;
+    buf[r] = '\0';
+    return 0;
 }
 static int find_dev(char *out, size_t outn) {
     DIR *d = opendir("/sys/class/hidraw"); if (!d) return -1;
@@ -44,7 +46,7 @@ static int find_dev(char *out, size_t outn) {
         if (read_file(ip, in, sizeof in)) continue;
         in[strcspn(in, "\r\n ")] = '\0';
         if (strcmp(in, CONFIG_IFACE)) continue;
-        snprintf(out, outn, "/dev/%s", e->d_name); found = 0; break;
+        snprintf(out, outn, "/dev/%.*s", (int)(outn - 6), e->d_name); found = 0; break;
     }
     closedir(d); return found;
 }

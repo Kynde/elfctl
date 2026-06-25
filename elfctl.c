@@ -105,7 +105,10 @@ static int find_config_hidraw(char *out, size_t outn) {
         if (strcmp(ifnum, CONFIG_IFACE) != 0)
             continue;
 
-        snprintf(out, outn, "/dev/%s", e->d_name);
+        /* Bound the name copy to the destination so the compiler can prove no
+         * truncation (dirent.d_name is declared char[256]; hidraw names are
+         * short in practice, but -Wformat-truncation reasons about the max). */
+        snprintf(out, outn, "/dev/%.*s", (int)(outn - 6), e->d_name);
         found = 0;
         break;
     }
