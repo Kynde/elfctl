@@ -38,7 +38,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ELFCTL_VERSION "0.2.0"  /* dragged along by /release to match the git tag */
+#define ELFCTL_VERSION "0.3.0"  /* dragged along by /release to match the git tag */
 
 #define VENDOR  "3553"
 #define PRODUCT "C140"
