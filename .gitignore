@@ -1,3 +1,4 @@
 /probe
 /elfctl
+/experiment
 *.o

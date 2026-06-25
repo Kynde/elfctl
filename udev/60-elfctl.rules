@@ -1,0 +1,13 @@
+# PCsensor ElfKey devices — grant the local console user access to the
+# config hidraw node so elfctl can run without root.
+#
+# uaccess tags the device so it's owned by the active seat's user (logind),
+# which is the modern, multi-user-safe approach. GROUP/MODE are a fallback
+# for setups without systemd-logind seat management.
+#
+# Install:  sudo cp 60-elfctl.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload
+#           sudo udevadm trigger --subsystem-match=hidraw
+#
+# MK424BT 4-key macropad:
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3553", ATTRS{idProduct}=="c140", TAG+="uaccess", GROUP="wheel", MODE="0660"
