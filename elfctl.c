@@ -36,6 +36,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define ELFCTL_VERSION "0.1.0"  /* dragged along by /release to match the git tag */
+
 #define VENDOR  "3553"
 #define PRODUCT "C140"
 #define CONFIG_IFACE "01"   /* interface carrying the OUT endpoint (ep_05) */
@@ -501,7 +503,8 @@ static void usage(void) {
         "  elfctl set <key> <binding>  set one key, e.g. `set 1 f13`, `set 2 ctrl-c`\n"
         "  elfctl save [file]          dump config (stdout if no file)\n"
         "  elfctl load <file>          apply a config file\n"
-        "  elfctl keys                 list all supported key/modifier names\n\n"
+        "  elfctl keys                 list all supported key/modifier names\n"
+        "  elfctl --version            print the elfctl version\n\n"
         "bindings: a-z 0-9 f1-f24 enter esc tab space arrows etc.,\n"
         "          with modifier prefixes: ctrl- shift- alt- gui- (r* for right)\n"
         "          run `elfctl keys` for the full list\n");
@@ -512,6 +515,10 @@ int main(int argc, char **argv) {
     if (getenv("ELFCTL_DEBUG")) g_debug = 1;
     const char *cmd = argv[1];
 
+    if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "version") == 0) {
+        printf("elfctl %s\n", ELFCTL_VERSION);
+        return 0;
+    }
     if (strcmp(cmd, "list") == 0)
         return cmd_list();
     if (strcmp(cmd, "keys") == 0)

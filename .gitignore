@@ -2,3 +2,6 @@
 /elfctl
 /experiment
 *.o
+
+# personal device config (not part of the repo)
+/config

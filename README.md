@@ -27,6 +27,7 @@ elfctl set 2 ctrl-c         # modifiers: ctrl- shift- alt- gui- (r* = right)
 elfctl save my.conf         # dump config to a file (or stdout)
 elfctl load my.conf         # apply a config file
 elfctl keys                 # list every supported key/modifier name
+elfctl --version            # print the elfctl version
 ```
 
 ### Binding syntax
@@ -85,9 +86,19 @@ Single-key and shortcut (modifier+key) bindings work and are verified by
 read-back. **Macros / typed strings** (the ElfKey multi-report macro family)
 and LED / Bluetooth-name / sleep-timeout settings are not implemented yet.
 
+## Releases
+
+The git tag is the source of truth for the version (`v`-prefixed, e.g.
+`v0.1.0`); the bare number is mirrored in `ELFCTL_VERSION` in `elfctl.c` and
+reported by `elfctl --version`. Releases are cut with the bundled `/release`
+Claude Code skill (`.claude/skills/release/`): `/release patch|minor|major`
+bumps the latest tag, drags the macro along, pushes `master`, and creates the
+GitHub release with an oldest-first changelog.
+
 ## Files
 
 - `elfctl.c` — the tool.
 - `probe.c` — minimal read-only protocol probe (diagnostics; `make probe`).
 - `experiment.c` — scratch harness for protocol reverse-engineering (`make experiment`).
 - `udev/60-elfctl.rules` — device-access rule.
+- `.claude/skills/release/` — the `/release` skill.
