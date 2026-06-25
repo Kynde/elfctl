@@ -1,6 +1,11 @@
 /probe
 /elfctl
 /experiment
+/readsweep
+/layerprobe
+/listen
+/layerwrite
+/layerctl
 *.o
 
 # personal device config (not part of the repo)

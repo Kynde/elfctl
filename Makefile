@@ -4,9 +4,9 @@ PREFIX  ?= /usr/local
 BINDIR   = $(PREFIX)/bin
 
 BIN      = elfctl
-EXTRA    = probe experiment
+EXTRA    = probe experiment readsweep layerprobe listen layerwrite layerctl
 
-.PHONY: all help clean install uninstall install-udev
+.PHONY: all help clean install uninstall install-udev diag
 
 all: $(BIN)  ## Build elfctl (default)
 
@@ -19,11 +19,11 @@ help:  ## List available targets
 $(BIN): $(BIN).c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# Diagnostic helpers, built on demand (not part of `all`).
-probe: probe.c  ## Build the read-only protocol probe
-	$(CC) $(CFLAGS) -o $@ $<
+# Diagnostic helpers (sources live in docs/ — they're reference artifacts now),
+# built on demand to the repo root; not part of `all`.
+diag: $(EXTRA)  ## Build all diagnostic helpers
 
-experiment: experiment.c  ## Build the protocol reverse-engineering scratch harness
+$(EXTRA): %: docs/%.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 install: $(BIN)  ## Install elfctl to $(BINDIR)

@@ -42,14 +42,28 @@
 #define PRODUCT "C140"
 #define CONFIG_IFACE "01"   /* interface carrying the OUT endpoint (ep_05) */
 #define NUM_KEYS 4
+#define NUM_LAYERS 3        /* MK424BT stores 3 layers, switched by the S button */
 
 /* ---- ElfKey command opcodes (byte[1] of the 8-byte report payload) ----
- * NOTE: only the read/set-key opcodes are used here. The protocol family
- * also contains firmware-flash (0x20) and set-model (0x60) opcodes which
- * this tool deliberately never emits. */
+ * NOTE: only read/set-key and the layer opcodes are used here. The protocol
+ * family also contains firmware-flash (0x20) and set-model (0x60) opcodes
+ * which this tool deliberately never emits. */
 #define OP_READ_MODEL 0x83
 #define OP_READ_KEY   0x82
 #define OP_SET_KEY    0x81
+
+/* Layer (a.k.a. "func layer") opcodes. Verified against the MK424BT and the
+ * official ElfKey configurator's own source (readFuncLayerCmd etc.). A key on
+ * layer L (1-based) lives at device index (L-1)*16 + key, so the S button just
+ * switches which 16-index block the keys read from. byte[2] of OP_ENABLE_LAYERS
+ * is a bitmask: bit0=L1 (always on), bit1=L2, bit2=L3 -> 0x01/0x03/0x07. */
+#define OP_READ_ACTIVE_LAYER  0xD1  /* resp: [d1 00 <active>] */
+#define OP_ENABLE_LAYERS      0xD2  /* [01 d2 <mask> ..] set enabled-layers mask */
+#define OP_READ_ENABLED_MASK  0xD3  /* resp: [d3 <mask> 00] */
+#define OP_SWITCH_LAYER       0xD4  /* [01 d4 <layer> ..] software S-button */
+
+/* Device key index for a 1-based (layer, key). */
+static int key_index(int layer, int key) { return (layer - 1) * 16 + key; }
 
 static int g_debug = 0; /* enabled via ELFCTL_DEBUG env */
 
@@ -337,9 +351,10 @@ static int do_read_model(int fd, char *model, size_t mn, char *fw, size_t fn) {
     return 0;
 }
 
-/* Read one key slot's (mod,key). Returns 0 on success. */
-static int read_key(int fd, int keynum, uint8_t *mod, uint8_t *key) {
-    uint8_t cmd[8] = {1, OP_READ_KEY, 8, (uint8_t)keynum, 0, 0, 0, 0};
+/* Read one slot at device index `idx` into (mod,key). Returns 0 on success.
+ * idx is (layer-1)*16 + key; for layer 1 it equals the key number. */
+static int read_key(int fd, int idx, uint8_t *mod, uint8_t *key) {
+    uint8_t cmd[8] = {1, OP_READ_KEY, 8, (uint8_t)idx, 0, 0, 0, 0};
     drain_input(fd); /* clear any stale/ACK reports so we read THIS response */
     if (write_cmd(fd, cmd) != 0)
         return -1;
@@ -361,11 +376,11 @@ static int read_key(int fd, int keynum, uint8_t *mod, uint8_t *key) {
     return -1;
 }
 
-/* Write one key slot to a single (mod,key) binding, then read back to verify.
- * Returns 0 on verified success. */
-static int set_key(int fd, int keynum, uint8_t mod, uint8_t key) {
+/* Write the slot at device index `idx` to a single (mod,key) binding, then read
+ * back to verify. Returns 0 on verified success. */
+static int set_key(int fd, int idx, uint8_t mod, uint8_t key) {
     /* header: set-key opcode, byte[2]=payload length (4), byte[3]=key index */
-    uint8_t hdr[8] = {1, OP_SET_KEY, 0x04, (uint8_t)keynum, 0, 0, 0, 0};
+    uint8_t hdr[8] = {1, OP_SET_KEY, 0x04, (uint8_t)idx, 0, 0, 0, 0};
     /* data report mirrors the read layout: [len=4, count=1, mod, key, ...] */
     uint8_t data[8] = {0x04, 0x01, mod, key, 0, 0, 0, 0};
     if (write_cmd(fd, hdr) != 0)
@@ -375,13 +390,52 @@ static int set_key(int fd, int keynum, uint8_t mod, uint8_t key) {
     drain_input(fd); /* consume the device's set-key ACK report (byte[1]=0x55) */
 
     uint8_t rmod, rkey;
-    if (read_key(fd, keynum, &rmod, &rkey) != 0) {
-        fprintf(stderr, "elfctl: wrote key%d but could not read back to verify\n", keynum);
+    if (read_key(fd, idx, &rmod, &rkey) != 0) {
+        fprintf(stderr, "elfctl: wrote index %d but could not read back to verify\n", idx);
         return -1;
     }
     if (rmod != mod || rkey != key) {
-        fprintf(stderr, "elfctl: verify mismatch on key%d: wrote mod=%02x key=%02x, "
-                        "read mod=%02x key=%02x\n", keynum, mod, key, rmod, rkey);
+        fprintf(stderr, "elfctl: verify mismatch at index %d: wrote mod=%02x key=%02x, "
+                        "read mod=%02x key=%02x\n", idx, mod, key, rmod, rkey);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------- layers ----------------------------------- */
+
+/* Send a layer read opcode and return the data byte at response offset `off`,
+ * or -1. Responses echo the opcode in byte[0]: 0xD1 -> [d1 00 <active>] (off 2),
+ * 0xD3 -> [d3 <mask> 00] (off 1). */
+static int read_layer_byte(int fd, uint8_t opcode, int off) {
+    drain_input(fd);
+    uint8_t cmd[8] = {1, opcode, 0, 0, 0, 0, 0, 0};
+    if (write_cmd(fd, cmd) != 0)
+        return -1;
+    uint8_t r[64];
+    for (int tries = 0; tries < 8; tries++) {
+        ssize_t n = read_report(fd, r, sizeof r, 1000);
+        if (n <= off)
+            continue;
+        if (r[0] == opcode)
+            return r[off];
+    }
+    return -1;
+}
+
+static int read_active_layer(int fd) { return read_layer_byte(fd, OP_READ_ACTIVE_LAYER, 2); }
+static int read_enabled_mask(int fd) { return read_layer_byte(fd, OP_READ_ENABLED_MASK, 1); }
+
+/* Write the enabled-layers bitmask, then read it back. Returns 0 if verified. */
+static int set_enabled_mask(int fd, uint8_t mask) {
+    uint8_t cmd[8] = {1, OP_ENABLE_LAYERS, mask, 0, 0, 0, 0, 0};
+    if (write_cmd(fd, cmd) != 0)
+        return -1;
+    drain_input(fd);
+    int rb = read_enabled_mask(fd);
+    if (rb < 0 || (uint8_t)rb != mask) {
+        fprintf(stderr, "elfctl: enable-layers verify failed (wrote 0x%02x, read 0x%02x)\n",
+                mask, rb);
         return -1;
     }
     return 0;
@@ -412,40 +466,73 @@ static int cmd_keys(void) {
     return 0;
 }
 
+/* The enabled-layers mask is always a contiguous run from L1, so it maps 1:1 to
+ * a count: 0x01->1, 0x03->2, 0x07->3. (Matches the official app's only values.) */
+static int mask_to_count(int mask) {
+    if (mask < 0) return -1;
+    return (mask & 4) ? 3 : (mask & 2) ? 2 : 1;
+}
+static uint8_t count_to_mask(int count) {
+    return (uint8_t)((1u << count) - 1);  /* 1->0x01, 2->0x03, 3->0x07 */
+}
+
 static int cmd_list(void) {
     int fd = dev_open();
     if (fd < 0) return 1;
     char model[32], fw[32];
     int rc = do_read_model(fd, model, sizeof model, fw, sizeof fw);
+    int mask = read_enabled_mask(fd);
     close(fd);
     if (rc != 0) { fprintf(stderr, "elfctl: read failed\n"); return 1; }
-    printf("%-10s %s:%s  (%d keys)  firmware %s\n",
-           model, "3553", "c140", NUM_KEYS, fw);
+    printf("%-10s %s:%s  (%d keys, %d/%d layers enabled)  firmware %s\n",
+           model, "3553", "c140", NUM_KEYS, mask_to_count(mask), NUM_LAYERS, fw);
     return 0;
 }
 
-static int cmd_get(int as_config) {
-    int fd = dev_open();
-    if (fd < 0) return 1;
+/* Print one layer's bindings. `as_config` selects file vs human format; for
+ * layer 1 the file form stays bare `keyN` (backward compatible), higher layers
+ * use `layerL.keyN`. Returns 0 on success. */
+static int print_layer(int fd, int layer, int as_config) {
     for (int k = 1; k <= NUM_KEYS; k++) {
         uint8_t mod, key;
-        if (read_key(fd, k, &mod, &key) != 0) {
-            fprintf(stderr, "elfctl: failed reading key%d\n", k);
-            close(fd);
-            return 1;
+        if (read_key(fd, key_index(layer, k), &mod, &key) != 0) {
+            fprintf(stderr, "elfctl: failed reading layer%d key%d\n", layer, k);
+            return -1;
         }
         char b[64];
         format_binding(mod, key, b, sizeof b);
-        if (as_config)
-            printf("key%d = %s\n", k, b);
-        else
-            printf("key%d: %s\n", k, b);
+        if (as_config && layer == 1)      printf("key%d = %s\n", k, b);
+        else if (as_config)               printf("layer%d.key%d = %s\n", layer, k, b);
+        else                              printf("  key%d: %s\n", k, b);
+    }
+    return 0;
+}
+
+/* Show bindings. `which` selects a single layer (1..NUM_LAYERS) or 0 for all. */
+static int cmd_get(int as_config, int which) {
+    int fd = dev_open();
+    if (fd < 0) return 1;
+    int mask = read_enabled_mask(fd);
+    int lo = which ? which : 1, hi = which ? which : NUM_LAYERS;
+    if (as_config && !which)
+        printf("layers = %d\n\n", mask_to_count(mask));
+    for (int layer = lo; layer <= hi; layer++) {
+        if (!as_config && (which || NUM_LAYERS > 1)) {
+            int on = (layer == 1) || (mask >= 0 && (mask & (1 << (layer - 1))));
+            printf("layer %d%s:\n", layer, on ? "" : " (disabled)");
+        }
+        if (print_layer(fd, layer, as_config) != 0) { close(fd); return 1; }
+        if (as_config && layer < hi) printf("\n");
     }
     close(fd);
     return 0;
 }
 
-static int cmd_set(int keynum, const char *binding) {
+static int cmd_set(int layer, int keynum, const char *binding) {
+    if (layer < 1 || layer > NUM_LAYERS) {
+        fprintf(stderr, "elfctl: layer must be 1..%d\n", NUM_LAYERS);
+        return 1;
+    }
     if (keynum < 1 || keynum > NUM_KEYS) {
         fprintf(stderr, "elfctl: key must be 1..%d\n", NUM_KEYS);
         return 1;
@@ -455,13 +542,65 @@ static int cmd_set(int keynum, const char *binding) {
         return 1;
     int fd = dev_open();
     if (fd < 0) return 1;
-    int rc = set_key(fd, keynum, mod, key);
+    int rc = set_key(fd, key_index(layer, keynum), mod, key);
     close(fd);
     if (rc == 0) {
         char b[64];
         format_binding(mod, key, b, sizeof b);
-        printf("key%d = %s  (ok)\n", keynum, b);
+        printf("layer%d key%d = %s  (ok)\n", layer, keynum, b);
     }
+    return rc == 0 ? 0 : 1;
+}
+
+/* Parse a key spec "K" (layer 1) or "L:K" into (layer, key). Returns 0 on ok. */
+static int parse_keyspec(const char *s, int *layer, int *key) {
+    int a, b;
+    if (sscanf(s, "%d:%d", &a, &b) == 2) { *layer = a; *key = b; return 0; }
+    if (sscanf(s, "%d", &a) == 1)        { *layer = 1; *key = a; return 0; }
+    return -1;
+}
+
+/* `layers` with no arg shows status; with an arg sets the enabled count (1..3). */
+static int cmd_layers(int argc, char **argv) {
+    int fd = dev_open();
+    if (fd < 0) return 1;
+    if (argc < 3) {
+        int mask = read_enabled_mask(fd);
+        int active = read_active_layer(fd);
+        close(fd);
+        if (mask < 0) { fprintf(stderr, "elfctl: failed reading layer state\n"); return 1; }
+        printf("enabled: %d of %d layers (mask 0x%02x); active-layer byte %d\n",
+               mask_to_count(mask), NUM_LAYERS, mask, active);
+        printf("(the S button cycles among enabled layers; LED red=1 green=2 blue=3)\n");
+        return 0;
+    }
+    int n = atoi(argv[2]);
+    if (n < 1 || n > NUM_LAYERS) {
+        fprintf(stderr, "elfctl: layer count must be 1..%d\n", NUM_LAYERS);
+        close(fd);
+        return 1;
+    }
+    int rc = set_enabled_mask(fd, count_to_mask(n));
+    close(fd);
+    if (rc == 0)
+        printf("enabled %d layer%s  (ok)\n", n, n == 1 ? "" : "s");
+    return rc == 0 ? 0 : 1;
+}
+
+/* Software equivalent of the physical S button: switch the active layer. */
+static int cmd_switch(const char *arg) {
+    int layer = atoi(arg);
+    if (layer < 1 || layer > NUM_LAYERS) {
+        fprintf(stderr, "elfctl: layer must be 1..%d\n", NUM_LAYERS);
+        return 1;
+    }
+    int fd = dev_open();
+    if (fd < 0) return 1;
+    uint8_t cmd[8] = {1, OP_SWITCH_LAYER, (uint8_t)layer, 0, 0, 0, 0, 0};
+    int rc = write_cmd(fd, cmd);
+    drain_input(fd);
+    close(fd);
+    if (rc == 0) printf("switched to layer %d  (ok)\n", layer);
     return rc == 0 ? 0 : 1;
 }
 
@@ -476,12 +615,32 @@ static int cmd_load(const char *path) {
         char *p = line;
         while (isspace((unsigned char)*p)) p++;
         if (*p == '#' || *p == '\0' || *p == '\n') continue;
-        int kn; char bind[128];
-        if (sscanf(p, "key%d = %127s", &kn, bind) == 2 ||
-            sscanf(p, "key%d=%127s", &kn, bind) == 2) {
+        int ln, kn, count; char bind[128];
+        if (sscanf(p, "layers = %d", &count) == 1 ||
+            sscanf(p, "layers=%d", &count) == 1) {
+            if (count < 1 || count > NUM_LAYERS) {
+                fprintf(stderr, "elfctl: bad layer count %d\n", count); rc = 1; continue;
+            }
+            if (set_enabled_mask(fd, count_to_mask(count)) != 0) { rc = 1; continue; }
+            printf("layers = %d  (ok)\n", count);
+        } else if (sscanf(p, "layer%d.key%d = %127s", &ln, &kn, bind) == 3 ||
+                   sscanf(p, "layer%d.key%d=%127s", &ln, &kn, bind) == 3) {
             uint8_t mod, key;
+            if (ln < 1 || ln > NUM_LAYERS || kn < 1 || kn > NUM_KEYS) {
+                fprintf(stderr, "elfctl: bad layer/key in: %s", line); rc = 1; continue;
+            }
             if (parse_binding(bind, &mod, &key) != 0) { rc = 1; continue; }
-            if (set_key(fd, kn, mod, key) != 0) { rc = 1; continue; }
+            if (set_key(fd, key_index(ln, kn), mod, key) != 0) { rc = 1; continue; }
+            char b[64]; format_binding(mod, key, b, sizeof b);
+            printf("layer%d.key%d = %s  (ok)\n", ln, kn, b);
+        } else if (sscanf(p, "key%d = %127s", &kn, bind) == 2 ||
+                   sscanf(p, "key%d=%127s", &kn, bind) == 2) {
+            uint8_t mod, key;
+            if (kn < 1 || kn > NUM_KEYS) {
+                fprintf(stderr, "elfctl: bad key in: %s", line); rc = 1; continue;
+            }
+            if (parse_binding(bind, &mod, &key) != 0) { rc = 1; continue; }
+            if (set_key(fd, key_index(1, kn), mod, key) != 0) { rc = 1; continue; }
             char b[64]; format_binding(mod, key, b, sizeof b);
             printf("key%d = %s  (ok)\n", kn, b);
         } else {
@@ -499,12 +658,18 @@ static void usage(void) {
         "elfctl — configure PCsensor ElfKey (MK424BT, 3553:c140)\n\n"
         "usage:\n"
         "  elfctl list                 identify the device\n"
-        "  elfctl get                  show current key bindings\n"
+        "  elfctl get [layer]          show key bindings (all layers, or one)\n"
         "  elfctl set <key> <binding>  set one key, e.g. `set 1 f13`, `set 2 ctrl-c`\n"
-        "  elfctl save [file]          dump config (stdout if no file)\n"
+        "                              key may be `L:K` to target a layer, e.g. `set 2:1 g`\n"
+        "  elfctl layers [N]           show enabled layers, or enable N (1..3)\n"
+        "  elfctl switch <layer>       switch active layer (software S button)\n"
+        "  elfctl save [file]          dump config incl. layers (stdout if no file)\n"
         "  elfctl load <file>          apply a config file\n"
         "  elfctl keys                 list all supported key/modifier names\n"
         "  elfctl --version            print the elfctl version\n\n"
+        "layers: the MK424BT stores 3 layers cycled by the physical S button (LED\n"
+        "        red=1 green=2 blue=3). Only layer 1 is enabled at the factory;\n"
+        "        `layers 3` enables all three. Keys are addressed K (layer 1) or L:K.\n\n"
         "bindings: a-z 0-9 f1-f24 enter esc tab space arrows etc.,\n"
         "          with modifier prefixes: ctrl- shift- alt- gui- (r* for right)\n"
         "          run `elfctl keys` for the full list\n");
@@ -524,17 +689,28 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "keys") == 0)
         return cmd_keys();
     if (strcmp(cmd, "get") == 0)
-        return cmd_get(0);
+        return cmd_get(0, argc >= 3 ? atoi(argv[2]) : 0);
+    if (strcmp(cmd, "layers") == 0)
+        return cmd_layers(argc, argv);
+    if (strcmp(cmd, "switch") == 0) {
+        if (argc != 3) { usage(); return 2; }
+        return cmd_switch(argv[2]);
+    }
     if (strcmp(cmd, "save") == 0) {
         if (argc >= 3) {
             FILE *f = freopen(argv[2], "w", stdout);
             if (!f) { fprintf(stderr, "elfctl: cannot write %s\n", argv[2]); return 1; }
         }
-        return cmd_get(1);
+        return cmd_get(1, 0);
     }
     if (strcmp(cmd, "set") == 0) {
         if (argc != 4) { usage(); return 2; }
-        return cmd_set(atoi(argv[2]), argv[3]);
+        int layer, key;
+        if (parse_keyspec(argv[2], &layer, &key) != 0) {
+            fprintf(stderr, "elfctl: bad key spec '%s' (use K or L:K)\n", argv[2]);
+            return 2;
+        }
+        return cmd_set(layer, key, argv[3]);
     }
     if (strcmp(cmd, "load") == 0) {
         if (argc != 3) { usage(); return 2; }
