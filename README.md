@@ -26,6 +26,7 @@ elfctl set 1 f13            # set key 1 to F13
 elfctl set 2 ctrl-c         # modifiers: ctrl- shift- alt- gui- (r* = right)
 elfctl save my.conf         # dump config to a file (or stdout)
 elfctl load my.conf         # apply a config file
+elfctl keys                 # list every supported key/modifier name
 ```
 
 ### Binding syntax
@@ -39,6 +40,9 @@ A single key with optional modifier prefixes joined by `-` or `+`:
   right-hand variant (`rctrl`, `ralt`/`altgr`, …).
 
 Examples: `f13`, `ctrl-c`, `shift-tab`, `gui-l`, `ctrl-shift-esc`.
+
+Run `elfctl keys` for the full, authoritative list (it's generated from the
+parser's own tables, so it always matches what `set` accepts).
 
 ### Config file format
 

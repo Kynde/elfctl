@@ -385,6 +385,31 @@ static int set_key(int fd, int keynum, uint8_t mod, uint8_t key) {
     return 0;
 }
 
+/* Print every key/modifier name the binding parser accepts. Generated from the
+ * same KEYS[]/MODS[] tables and algorithmic ranges used by keyname_to_code(),
+ * so it can never drift out of sync with what `set` actually understands. */
+static int cmd_keys(void) {
+    printf("Modifiers (prefix with '-' or '+', e.g. ctrl-c):\n ");
+    for (size_t i = 0; i < sizeof MODS / sizeof MODS[0]; i++)
+        printf(" %s", MODS[i].name);
+    printf("\n\n");
+
+    printf("Letters:    a b c ... z\n");
+    printf("Digits:     0 1 2 ... 9\n");
+    printf("Function:   f1 f2 ... f24\n\n");
+
+    printf("Named keys:\n ");
+    /* KEYS[] holds aliases too (enter/return, esc/escape, ...); list every
+     * accepted spelling so nothing the parser takes is hidden. */
+    int col = 0;
+    for (size_t i = 0; i < sizeof KEYS / sizeof KEYS[0]; i++) {
+        printf(" %-12s", KEYS[i].name);
+        if (++col % 5 == 0) printf("\n ");
+    }
+    printf("\n\nExamples: f13   ctrl-c   shift-tab   gui-l   ctrl-shift-esc\n");
+    return 0;
+}
+
 static int cmd_list(void) {
     int fd = dev_open();
     if (fd < 0) return 1;
@@ -475,9 +500,11 @@ static void usage(void) {
         "  elfctl get                  show current key bindings\n"
         "  elfctl set <key> <binding>  set one key, e.g. `set 1 f13`, `set 2 ctrl-c`\n"
         "  elfctl save [file]          dump config (stdout if no file)\n"
-        "  elfctl load <file>          apply a config file\n\n"
+        "  elfctl load <file>          apply a config file\n"
+        "  elfctl keys                 list all supported key/modifier names\n\n"
         "bindings: a-z 0-9 f1-f24 enter esc tab space arrows etc.,\n"
-        "          with modifier prefixes: ctrl- shift- alt- gui- (r* for right)\n");
+        "          with modifier prefixes: ctrl- shift- alt- gui- (r* for right)\n"
+        "          run `elfctl keys` for the full list\n");
 }
 
 int main(int argc, char **argv) {
@@ -487,6 +514,8 @@ int main(int argc, char **argv) {
 
     if (strcmp(cmd, "list") == 0)
         return cmd_list();
+    if (strcmp(cmd, "keys") == 0)
+        return cmd_keys();
     if (strcmp(cmd, "get") == 0)
         return cmd_get(0);
     if (strcmp(cmd, "save") == 0) {
