@@ -165,6 +165,110 @@ read back fine with no bleed into layer 1, but S still would not reach layer 2.
 So enabling a layer is independent of editing its bindings — it requires `0xD2`.
 (idx17 was restored to 0x0a.)
 
+## Macros — the `0xC0`-family opcodes
+
+The MK424BT supports **macros**: named, multi-step sequences with per-step
+timing, stored in a separate **macro table** and referenced from a key slot.
+This is a different mechanism from the single-chord `set-key` binding — a key
+does not *contain* a macro, it *points at* one.
+
+Source: the official ElfKey configurator (`out/main/index.js`, functions
+`setMacro`/`readMacroList`/`deleteMacro`, opcode constants in its `constants`
+module) **and** rgerganov's `footswitch` driver, which speaks the same PCsensor
+protocol family (its VID/PID table includes `3553:b001`, a sibling of our
+`3553:c140`). The string/key encodings match the ones `elfctl` already uses.
+**(Verification status: opcodes and framing are documented in two independent
+sources; the exact `type`/`mode` enum values are decoded from the app and want
+one hardware read-back to pin down — see `macroprobe.c`.)**
+
+### Two pieces: a macro table, and a key→macro link
+
+| Opcode | Name | Send | Meaning |
+|--------|------|------|---------|
+| `0xC0` | set-macro    | `01 C0 <lenHi> <lenLo> <id> …` + data reports | define/overwrite macro `<id>` (id in **byte[4]**) |
+| `0xC1` | read-macro   | `01 C1 00 <id> …` | read macro `<id>` (id in **byte[3]**) |
+| `0xC2` | delete-macro | `01 C2 00 <id> …` | clear macro `<id>` (id in **byte[3]**) |
+
+The id-byte positions differ between set (byte[4]) and read/delete (byte[3]) —
+matches the app's `setMacroCmd[4]` vs. `readMacroListCmd[3]`/`deleteMacroCmd[3]`.
+**Verified on hardware:** querying `0xC1` with the id in byte[3] returns the
+all-`0xff` empty-slot sentinel for an undefined slot (the app's
+`every(v === 255)` check); putting the id in the wrong byte returns a generic
+malformed-command reply instead. Unlike the `0xD` layer family, `0xC1` does
+**not** echo the opcode — the response is the name/action stream directly.
+
+**8 macro slots** (`id` 1..8) on the MK424BT. The app caps at 6 only for the
+"short macro" device class, which this device is **not** (`hasShortMacro()` is
+false whenever `hasMacro()` is true, and `MK424` is in `hasMacro()`).
+
+A **key slot points at a macro** by being written with the ordinary set-key
+command (`0x81`) but with **key-type `0x0A`** (macro) and the macro id in place
+of the keycode. The app's `saveMacro` does exactly:
+
+```
+header : 01 81 08 <keyNum> 00 00 00 00     (note byte[2]=0x08, not 0x04)
+data   : 08 0A <macroId> 00 00 00 00 00
+```
+
+So `elfctl`'s `data[1]` byte — which the code currently calls "count" and always
+sets to `0x01` — is really the **key TYPE**. The app's `readKey` switches on it:
+`1`=single key, `2`=mouse, `7`=media, `0x0A`=macro link (others: game, MIDI,
+loop/double-trigger). Reading a macro-linked key back yields type `0x0A` with the
+id in byte[3]; that is how `get`/`save` can stay honest about macro bindings.
+
+### Macro wire format (`0xC0` write)
+
+Header then a stream of 8-byte data reports:
+
+```
+header        : 01 C0 <lenHi> <lenLo> <id> 00 00 00
+4 × report    : 32 bytes of NAME (UTF-8, NUL-padded)
+1 × report    : <lenHi> <lenLo> <mode> <action bytes 0..4>
+N × report    : remaining action bytes, 8 per report
+```
+
+`len` is `actionBytes + 3` as a **16-bit big-endian** count (so macros can be far
+longer than one report; the real per-device ceiling is unconfirmed). `mode` is
+the macro playback mode (once / repeat-while-held / toggle — exact values
+**unverified**, decode with `macroprobe.c`).
+
+Each **action** is a length-prefixed record. Two kinds:
+
+```
+keyboard (len 7): 07 01 <modMask> <keyCode> <type> <delayHi> <delayLo>
+mouse    (len 9): 09 02 <button> <x> <y> <wheel> <type> <delayHi> <delayLo>
+```
+
+- **One key OR one modifier per action**, not a combined chord: the encoder emits
+  `<modMask>,0` for a modifier-only step and `0,<keyCode>` for a key step. A chord
+  like `ctrl-c` is therefore several actions (press ctrl, press c, release c,
+  release ctrl) sequenced via the `type` field.
+- **`modMask`** bit order is identical to `elfctl`'s `MODS` table
+  (bit0=ctrl … bit7=rgui). **`keyCode`** is the same HID usage table
+  `keyname_to_code()` already implements.
+- **`type`** = per-action press / release / click (default `1`). Exact values
+  **unverified**. The live "record macro" flow uses a parallel `0xC3` family
+  (`enter`=`01 C3 00 01`, `pressed`=`…02`, `released`=`…03`, `validate`=`…04`);
+  `type` is the stored-form equivalent.
+- **`delay`** is per-action milliseconds, **16-bit big-endian**. This pad stores
+  real inter-step timing, not just a keystroke list.
+
+### Reading back (`0xC1`)
+
+Response is the inverse of the write: first report carries the start of the
+32-byte name, three more complete it, then a report with `<lenHi> <lenLo> <mode>`
+and the first action bytes, then the rest 8-per-report. `readMacroList` treats a
+slot as empty when its bytes are all `0x00` or all `0xFF`. Actions are walked by
+their leading length byte until a `0` length terminates the list.
+
+### Safety
+
+`0xC0`/`0xC1`/`0xC2` are documented opcodes (two independent sources), not blind
+fuzz. `0xC1` is read-only. `0xC0`/`0xC2` change state but are fully recoverable:
+read a slot first, and a macro can be rewritten or deleted with no effect on key
+bindings or other slots. Linking a key to a macro is a normal `0x81` write and is
+reversible by writing any ordinary binding back.
+
 ## Diagnostic tools (this directory)
 
 These `.c` files live alongside this doc as reverse-engineering artifacts. Build
@@ -185,6 +289,10 @@ firmware-flash/set-model.
 - `layerctl.c` — drives the layer opcodes `0xD1`–`0xD4`: read active layer / read
   enabled mask (read-only), enable a bitmask, switch layer. The layer logic here
   is what got folded into `elfctl`'s `layers`/`switch` commands.
+- `macroprobe.c` — **read-only** dump of all 8 macro slots via `0xC1`: prints raw
+  reports plus a decode of name / mode / each action (mod, key, type, delay). Used
+  to confirm the `0xC0`-family framing and pin down the `type`/`mode` enum values
+  before they were folded into `elfctl`'s `macro` commands.
 
 The `0xD1`–`0xD4` opcodes are documented in the official configurator's source,
 so emitting them is not a blind fuzz. `0xD2`/`0xD4` change state but are

@@ -6,6 +6,7 @@
 /listen
 /layerwrite
 /layerctl
+/macroprobe
 *.o
 
 # personal device config (not part of the repo)
