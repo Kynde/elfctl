@@ -59,7 +59,10 @@ d1 00 84 00 00 00 00 00
 ### Layer is indicated by LED colour (not over HID)
 
 Per the ElfKey docs: **red = layer 1, green = layer 2, blue = layer 3**. This is
-the only layer-readback available (the `0xd1` notification carries no index).
+the only *at-a-glance* indicator, and the only one available on this channel —
+the `0xd1` notification carries no index. (The active layer **can** be read back
+over HID, but only by *querying* `0xD1` on the config interface; see the
+`0xD0`-family section below.)
 Verified: at factory default the backlight **stays red** across repeated S
 presses — it never goes green/blue — confirming the device is locked to layer 1
 and the S "blink" is only a press-acknowledge with no enabled layer to switch
@@ -125,14 +128,31 @@ the official ElfKey configurator's own source (an Electron app; constants named
 
 | Opcode | Name | Send | Response | Meaning |
 |--------|------|------|----------|---------|
-| `0xD1` | read active layer  | `01 D1 00 …` | `d1 00 <active>` | active layer is **byte[2]** |
+| `0xD1` | read active layer  | `01 D1 00 …` | `d1 <active-1> <mask>` | active at **byte[1]**, 0-based |
 | `0xD2` | enable layers      | `01 D2 <mask> …` | (ACK) | set enabled-layers bitmask |
-| `0xD3` | read enabled mask  | `01 D3 00 …` | `d3 <mask> 00` | enabled mask is **byte[1]** |
-| `0xD4` | switch layer       | `01 D4 <layer> …` | (ACK) | software S-button press |
+| `0xD3` | read enabled mask  | `01 D3 00 …` | `d3 <mask> <active-1>` | mask at **byte[1]** |
+| `0xD4` | switch layer       | `01 D4 <layer> …` | (ACK) | software S-button press, **1-based** |
 
-(Response framing differs per opcode — `0xD1`'s data is at byte[2], `0xD3`'s at
-byte[1]; both echo the opcode in byte[0]. Observed empirically, not from the
-app, which abstracts the offsets.)
+Both read opcodes return **both** fields, in mirrored order — `0xD1` gives
+`<active> <mask>`, `0xD3` gives `<mask> <active>` — with the opcode echoed in
+byte[0]. Observed empirically, not from the app, which abstracts the offsets.
+
+**Two off-by-one traps, verified across all three layers on firmware V1.1:**
+
+```
+0xD4 switch to layer 1/2/3  →  send 1 / 2 / 3      (1-based)
+0xD1 response byte[1]       →  reads 00 / 01 / 02  (0-based)
+```
+
+So the active layer is 0-based when read but 1-based when written. Reading
+byte[2] of the `0xD1` response instead of byte[1] yields the *mask*, which
+coincidentally equals the layer number when one layer is enabled (`0x01`→1) —
+a bug that hides itself at the factory default. `elfctl` did exactly this until
+it was caught by noticing the value tracked the mask instead of the switches.
+
+`0xD4` **refuses** a switch to a layer that is not enabled: the write is ACKed
+but the active layer is unchanged, so verify with a `0xD1` read afterwards
+rather than trusting the ACK.
 
 **Bitmask** (`byte[2]` of `0xD2`): bit0 = L1 (always on), bit1 = L2, bit2 = L3.
 Only three values are used: `0x01` = L1 only (factory default), `0x03` = L1+L2,
@@ -145,9 +165,10 @@ MK424BT the report ID is `0` — i.e. exactly the `00 01 D2 …` framing `elfctl
 `write_cmd()` already uses. No special handling needed.
 
 Note `0xD1` is the same opcode the S button emits as a notification
-(`d1 00 84 …`). On a button press byte[2] carried `0x84` (an event marker); when
-*queried* it returns the active layer number in byte[2]. Same opcode, two
-directions.
+(`d1 00 84 …`). The two directions do **not** share a payload layout: on a
+button press byte[2] carries `0x84` (an event marker, not a mask), whereas a
+*query* answers `d1 <active-1> <mask>`. Same opcode, two framings — don't parse
+an unsolicited notification with the query's offsets.
 
 ### Verified on hardware
 

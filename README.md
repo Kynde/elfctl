@@ -30,7 +30,7 @@ elfctl set 1 f13            # set key 1 to F13 (layer 1)
 elfctl set 2 ctrl-c         # modifiers: ctrl- shift- alt- gui- (r* = right)
 elfctl set 2:1 g            # set layer 2, key 1 to 'g'  (L:K syntax)
 elfctl set 1 macro:3        # run macro slot 3 when key 1 is pressed
-elfctl layers               # show how many layers are enabled
+elfctl layers               # show enabled layers + which one is currently active
 elfctl layers 3             # enable all 3 layers (so the S button cycles them)
 elfctl switch 2             # switch the active layer (software S-button press)
 elfctl macro list           # show the 8 macro slots

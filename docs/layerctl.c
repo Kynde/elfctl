@@ -5,7 +5,8 @@
  *   0xD1 readFuncLayerCmd        [1,209,0,..]  read ACTIVE layer
  *   0xD2 enableFuncLayerCmd      [1,210,m,..]  set ENABLED-layers bitmask (m)
  *   0xD3 readEnabledFuncLayerCmd [1,211,0,..]  read enabled-layers bitmask
- *   0xD4 switchFuncLayerCmd      [1,212,l,..]  switch ACTIVE layer (= S button)
+ *   0xD4 switchFuncLayerCmd      [1,212,l,..]  switch ACTIVE layer (= S button),
+ *                                              l is 1-based; refused if disabled
  * Bitmask: bit0=layer1(always), bit1=layer2, bit2=layer3.
  *   0x01 = L1 only (factory default), 0x03 = L1+L2, 0x07 = all three.
  *
@@ -74,10 +75,12 @@ static void drain(int fd) {
     while (poll(&p, 1, 30) > 0 && read(fd, b, sizeof b) > 0) ;
 }
 /* Send a read command and return the data byte from its response. The response
- * echoes the opcode in byte[0] (e.g. 0xD1 -> "d1 00 01 ..", 0xD3 -> "d3 01 00 ..").
- * Observed framing differs by opcode, so the caller passes the data-byte offset:
- *   0xD1 (active layer):  data at byte[2]   ("d1 00 <layer>")
- *   0xD3 (enabled mask):  data at byte[1]   ("d3 <mask> 00")
+ * echoes the opcode in byte[0] and carries BOTH fields, in mirrored order, so
+ * the caller passes the offset of the one it wants:
+ *   0xD1 -> "d1 <active-1> <mask>"   active at byte[1], mask at byte[2]
+ *   0xD3 -> "d3 <mask> <active-1>"   mask at byte[1], active at byte[2]
+ * The active layer is 0-BASED on the wire (layer 1 = 0), even though 0xD4 takes
+ * a 1-based layer. Verified on firmware V1.1 across all three layers.
  */
 static int cmd_read(int fd, uint8_t opcode, int data_off) {
     drain(fd);
@@ -101,10 +104,10 @@ int main(int argc, char **argv) {
     if (fd < 0) { perror("open"); return 1; }
 
     if (argc == 1) {
-        int active = cmd_read(fd, 0xD1, 2);
+        int active = cmd_read(fd, 0xD1, 1);
         int mask   = cmd_read(fd, 0xD3, 1);
-        printf("active layer (0xD1) : %d%s\n", active,
-               active < 0 ? "  (no/invalid response)" : "");
+        if (active < 0) printf("active layer (0xD1) : <no/invalid response>\n");
+        else            printf("active layer (0xD1) : %d\n", active + 1);
         if (mask < 0) printf("enabled mask (0xD3) : <no/invalid response>\n");
         else printf("enabled mask (0xD3) : 0x%02x  (L1%s%s)\n", mask,
                     (mask & 2) ? "+L2" : "", (mask & 4) ? "+L3" : "");
@@ -126,8 +129,10 @@ int main(int argc, char **argv) {
         printf("writing 0xD4 layer=%d ...\n", l);
         if (wr(fd, cmd)) { fprintf(stderr, "write failed\n"); close(fd); return 1; }
         drain(fd);
-        int active = cmd_read(fd, 0xD1, 2);
-        printf("active layer now: %d\n", active);
+        int active = cmd_read(fd, 0xD1, 1);
+        if (active < 0) printf("active layer now: <no/invalid response>\n");
+        else printf("active layer now: %d%s\n", active + 1,
+                    active + 1 == l ? "" : "  (refused — is that layer enabled?)");
         close(fd); return 0;
     }
     fprintf(stderr, "usage: %s [enable <mask> | switch <layer>]\n", argv[0]);

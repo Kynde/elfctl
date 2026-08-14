@@ -81,10 +81,10 @@
  * layer L (1-based) lives at device index (L-1)*16 + key, so the S button just
  * switches which 16-index block the keys read from. byte[2] of OP_ENABLE_LAYERS
  * is a bitmask: bit0=L1 (always on), bit1=L2, bit2=L3 -> 0x01/0x03/0x07. */
-#define OP_READ_ACTIVE_LAYER  0xD1  /* resp: [d1 00 <active>] */
+#define OP_READ_ACTIVE_LAYER  0xD1  /* resp: [d1 <active-1> <mask>] */
 #define OP_ENABLE_LAYERS      0xD2  /* [01 d2 <mask> ..] set enabled-layers mask */
-#define OP_READ_ENABLED_MASK  0xD3  /* resp: [d3 <mask> 00] */
-#define OP_SWITCH_LAYER       0xD4  /* [01 d4 <layer> ..] software S-button */
+#define OP_READ_ENABLED_MASK  0xD3  /* resp: [d3 <mask> <active-1>] */
+#define OP_SWITCH_LAYER       0xD4  /* [01 d4 <layer> ..] software S-button; 1-based */
 
 /* Device key index for a 1-based (layer, key). */
 static int key_index(int layer, int key) { return (layer - 1) * 16 + key; }
@@ -457,8 +457,11 @@ static int set_key(int fd, int idx, uint8_t mod, uint8_t key) {
 /* ------------------------------- layers ----------------------------------- */
 
 /* Send a layer read opcode and return the data byte at response offset `off`,
- * or -1. Responses echo the opcode in byte[0]: 0xD1 -> [d1 00 <active>] (off 2),
- * 0xD3 -> [d3 <mask> 00] (off 1). */
+ * or -1. Responses echo the opcode in byte[0] and carry BOTH fields, in mirrored
+ * order: 0xD1 -> [d1 <active-1> <mask>], 0xD3 -> [d3 <mask> <active-1>]. The
+ * active layer is 0-based on the wire (layer 1 = 0), even though 0xD4 takes a
+ * 1-based layer. Verified on firmware V1.1 across all three layers; see
+ * docs/PROTOCOL.md, "Enabling / switching layers". */
 static int read_layer_byte(int fd, uint8_t opcode, int off) {
     drain_input(fd);
     uint8_t cmd[8] = {1, opcode, 0, 0, 0, 0, 0, 0};
@@ -475,7 +478,11 @@ static int read_layer_byte(int fd, uint8_t opcode, int off) {
     return -1;
 }
 
-static int read_active_layer(int fd) { return read_layer_byte(fd, OP_READ_ACTIVE_LAYER, 2); }
+/* Returns the active layer as a 1-based number (1..NUM_LAYERS), or -1. */
+static int read_active_layer(int fd) {
+    int v = read_layer_byte(fd, OP_READ_ACTIVE_LAYER, 1);
+    return v < 0 ? -1 : v + 1;
+}
 static int read_enabled_mask(int fd) { return read_layer_byte(fd, OP_READ_ENABLED_MASK, 1); }
 
 /* Write the enabled-layers bitmask, then read it back. Returns 0 if verified. */
@@ -771,6 +778,16 @@ static uint8_t count_to_mask(int count) {
     return (uint8_t)((1u << count) - 1);  /* 1->0x01, 2->0x03, 3->0x07 */
 }
 
+/* Backlight colour the device shows for each active layer. */
+static const char *layer_led(int layer) {
+    switch (layer) {
+    case 1:  return "red";
+    case 2:  return "green";
+    case 3:  return "blue";
+    default: return "?";
+    }
+}
+
 static int cmd_list(void) {
     int fd = dev_open();
     if (fd < 0) return 1;
@@ -968,8 +985,12 @@ static int cmd_layers(int argc, char **argv) {
         int active = read_active_layer(fd);
         close(fd);
         if (mask < 0) { fprintf(stderr, "elfctl: failed reading layer state\n"); return 1; }
-        printf("enabled: %d of %d layers (mask 0x%02x); active-layer byte %d\n",
-               mask_to_count(mask), NUM_LAYERS, mask, active);
+        printf("enabled: %d of %d layers (mask 0x%02x)\n",
+               mask_to_count(mask), NUM_LAYERS, mask);
+        if (active < 0)
+            printf("active: <no response>\n");
+        else
+            printf("active: layer %d (LED %s)\n", active, layer_led(active));
         printf("(the S button cycles among enabled layers; LED red=1 green=2 blue=3)\n");
         return 0;
     }
@@ -995,12 +1016,21 @@ static int cmd_switch(const char *arg) {
     }
     int fd = dev_open();
     if (fd < 0) return 1;
+    /* NB: 0xD4 takes a 1-based layer, while 0xD1/0xD3 report it 0-based. */
     uint8_t cmd[8] = {1, OP_SWITCH_LAYER, (uint8_t)layer, 0, 0, 0, 0, 0};
     int rc = write_cmd(fd, cmd);
     drain_input(fd);
+    int active = (rc == 0) ? read_active_layer(fd) : -1;
     close(fd);
-    if (rc == 0) printf("switched to layer %d  (ok)\n", layer);
-    return rc == 0 ? 0 : 1;
+    if (rc != 0) return 1;
+    if (active > 0 && active != layer) {
+        fprintf(stderr, "elfctl: asked for layer %d but device is on layer %d (LED %s)"
+                        " — enable it first: elfctl layers %d\n",
+                layer, active, layer_led(active), layer);
+        return 1;
+    }
+    printf("switched to layer %d (LED %s)  (ok)\n", layer, layer_led(layer));
+    return 0;
 }
 
 /* Apply one binding token to slot `idx`: either `macro:N` (a macro link) or a
