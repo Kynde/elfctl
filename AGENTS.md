@@ -11,6 +11,9 @@ conventions for changing it safely.
   with `make` (`cc -O2 -Wall -Wextra`); keep it warning-clean.
 - `docs/PROTOCOL.md` — the reverse-engineered ElfKey protocol writeup. Update it
   in the same change whenever you learn or rely on a new wire detail.
+- `docs/OPCODES.md` — index of every opcode the official configurator defines,
+  including unimplemented ones. Check here before concluding a feature doesn't
+  exist; add to it whenever a new constant surfaces.
 - `docs/*.c` — diagnostic / reverse-engineering harnesses (see below).
 - `udev/60-elfctl.rules` — device-access rule (`uaccess` + `wheel` fallback).
 - `.claude/skills/release/` — the `/release` skill (see Releases).
@@ -28,6 +31,7 @@ the protocol was worked out; build any with `make <name>` (or all with
 | `layerprobe` | read-only tests of layer-addressing hypotheses | no |
 | `listen` | passive dual-interface listener; captured the S-button `0xd1` notification | no |
 | `macroprobe` | read-only dump of the 8 macro slots via `0xC1` | no |
+| `ledprobe` | read-only dump of the LED settings via `0x63`/`0xA4` | no |
 | `experiment` | single-key write harness (writes, then restores) | recoverable |
 | `layerwrite` | arbitrary-index write harness; proved the `(layer<<4)|key` map | recoverable |
 | `layerctl` | drives the layer opcodes `0xD1`–`0xD4` (read active/enabled; enable mask; switch) | reversible |
@@ -48,6 +52,32 @@ to probe it.
   configurator's source or a usbmon/USBPcap capture. The layer (`0xD0`-family)
   and macro (`0xC0`-family) opcodes were both pinned down this way — documented
   in two independent sources, then confirmed on hardware — never by guessing.
+
+### Getting the configurator's source (the ground truth)
+
+Opcodes live in the ElfKey Electron app's main bundle. **Use version 3.0.0, not
+the latest**: 3.3.5 compiles the main process to V8 bytecode (`out/main/index.jsc`
+plus a `bytecode-loader.js` shim), while 3.0.0 still ships plain JavaScript.
+
+```sh
+curl -O https://obs.pcsensor.cn/downloads/ElfKey/ElfKey-3.0.0-mac-x64.dmg
+7z x -odmg ElfKey-3.0.0-mac-x64.dmg
+npx @electron/asar extract-file dmg/ElfKey.app/Contents/Resources/app.asar \
+    out/main/index.js            # opcode constants + read/write functions
+# renderer holds the UI enums and their i18n labels:
+npx @electron/asar extract-file dmg/ElfKey.app/Contents/Resources/app.asar \
+    out/renderer/assets/main.56ce1998.js
+```
+
+Even when only a bytecode build is available, `strings` on the `.jsc` still
+leaks constant *names* (`readLedCmd`, `hasLightFlash`, …) — enough to tell you
+what exists and which older build is worth fetching, though not the byte values.
+
+Capability predicates (`hasLed()`, `hasMacro()`, `hasFuncLayer()`, …) live in
+the main bundle and gate features **by model string**. Always check that
+`MK424` is actually in the predicate before implementing a feature for it — the
+app is shared across the whole PCsensor device family and most features are not
+ours.
 
 Anything emitting opcodes belongs behind the same find-device / `write_cmd` /
 verify-by-read-back path the existing commands use.

@@ -33,6 +33,7 @@ elfctl set 1 macro:3        # run macro slot 3 when key 1 is pressed
 elfctl layers               # show enabled layers + which one is currently active
 elfctl layers 3             # enable all 3 layers (so the S button cycles them)
 elfctl switch 2             # switch the active layer (software S-button press)
+elfctl light get            # show the backlight settings (read-only)
 elfctl macro list           # show the 8 macro slots
 elfctl macro set 3 paste 'ctrl-c, 50ms, ctrl-v'   # define a macro
 elfctl macro delete 3       # clear a macro slot
@@ -96,6 +97,30 @@ several keys can share a macro.
 > press/release control are not exposed yet — every step is an atomic keypress.
 > See the status note below.
 
+### Backlight
+
+The MK424BT has a configurable backlight — an effect (off / blink-on-keypress /
+breathing / flashes), a 24-bit RGB colour and a multicolour toggle — plus a
+separate "border" LED. `elfctl light get` shows the current settings:
+
+```
+$ elfctl light get
+effect     breathing (3)
+color      #00ff00
+multicolor yes
+```
+
+**Reading is all that's implemented.** The write opcode (`0x62`) is fully
+decoded — byte layout and enum values are in
+[docs/PROTOCOL.md](docs/PROTOCOL.md#leds--backlight--the-0x620x63-and-0xa30xa4-opcodes)
+— but has never been emitted to a device, and the border-LED reply offset is
+still ambiguous, so there is deliberately no setter yet.
+
+Note the **charging marquee** (red running light over USB) and the full-charge
+breathing indicator are firmware power-status behaviours, not settings — they
+are not configurable through this protocol, and they override the configured
+effect while they're showing.
+
 ### Config file format
 
 ```
@@ -136,18 +161,22 @@ Working and verified by read-back on real hardware:
 - enabling / switching layers (the S button cycles enabled layers; LED
   red/green/blue),
 - **macros**: 8 named slots, multi-step sequences with per-step delays, and
-  linking a key to a macro.
+  linking a key to a macro,
+- **reading** the backlight settings (`light get`).
 
 Not implemented yet: macro playback modes (repeat/toggle) and per-step
-press/release control, typed-string macros, and the LED-color / Bluetooth-name
-/ sleep-timeout settings that also live in the ElfKey protocol family.
+press/release control, typed-string macros, and the Bluetooth-name / sleep-timeout
+settings that also live in the ElfKey protocol family.
 
 ## Documentation
 
 - **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — the byte-level ElfKey protocol:
   opcodes, the layer index layout, the S-button notification, the layer-enable
-  command, and the macro (`0xC0`) family. The reference for how the device
-  actually talks.
+  command, the macro (`0xC0`) family and the backlight (`0x62`/`0x63`) family.
+  The reference for how the device actually talks.
+- **[docs/OPCODES.md](docs/OPCODES.md)** — index of every ElfKey opcode the
+  official configurator defines, including the ones nothing here implements.
+  Useful for answering "does this device even have feature X?".
 - **[AGENTS.md](AGENTS.md)** — guide for working *on* elfctl: repo layout, the
   reverse-engineering harnesses in `docs/`, the protocol-safety rules, and how
   releases are cut.

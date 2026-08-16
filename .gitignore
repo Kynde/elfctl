@@ -7,6 +7,7 @@
 /layerwrite
 /layerctl
 /macroprobe
+/ledprobe
 *.o
 
 # personal device config (not part of the repo)

@@ -86,6 +86,19 @@
 #define OP_READ_ENABLED_MASK  0xD3  /* resp: [d3 <mask> <active-1>] */
 #define OP_SWITCH_LAYER       0xD4  /* [01 d4 <layer> ..] software S-button; 1-based */
 
+/* Backlight opcodes. From the official ElfKey configurator's source (readLedCmd
+ * / setLedCmd), where MK424 is explicitly listed in its hasLed() predicate — so
+ * this is the LED family our device actually speaks. The read (0x63) is
+ * verified on hardware; elfctl does NOT emit the write (0x62). See
+ * docs/PROTOCOL.md "LEDs / backlight". Note 0x62 sits next to the dangerous
+ * set-model opcode 0x60 — be exact about the byte.
+ *
+ * byte[2] of the read is a slot index (1..keycount; 10-12 are the sleep-LED
+ * scheme). The app's simple LED path reads slot 1, and so do we. */
+#define OP_READ_LED  0x63
+#define LED_SLOT     1
+#define LED_RECLEN   0x0D  /* the reply's leading length byte */
+
 /* Device key index for a 1-based (layer, key). */
 static int key_index(int layer, int key) { return (layer - 1) * 16 + key; }
 
@@ -778,6 +791,54 @@ static uint8_t count_to_mask(int count) {
     return (uint8_t)((1u << count) - 1);  /* 1->0x01, 2->0x03, 3->0x07 */
 }
 
+/* Current backlight settings, as stored on the device. */
+struct led {
+    uint8_t effect, color_mode, r, g, b, mode, flashes;
+};
+
+static const char *led_effect_name(uint8_t e) {
+    switch (e) {
+    case 1:  return "off";
+    case 2:  return "blink on keypress";
+    case 3:  return "breathing";
+    case 5:  return "flashes";
+    default: return "unknown";
+    }
+}
+
+/* Read the backlight settings via 0x63 (read-only). Returns 0 on success.
+ *
+ * The device replies with exactly the 13-byte record the app writes, across two
+ * reports, no shift:
+ *   0D <effect> <colorMode> <r> <g> <b> 01 E8 03 E8 03 <mode> <flashes>
+ * Beware: the configurator's own readLed() indexes each field ONE HIGHER,
+ * because node-hid hands it a leading report-ID byte that the kernel strips
+ * from hidraw. Any offset taken from the app's source needs -1 applied. The
+ * leading 0x0D length byte is what pins the alignment down, so verify it. */
+static int read_led(int fd, struct led *out) {
+    drain_input(fd);
+    uint8_t cmd[8] = {1, OP_READ_LED, LED_SLOT, 0, 0, 0, 0, 0};
+    if (write_cmd(fd, cmd) != 0)
+        return -1;
+
+    uint8_t rec[16];
+    if (read_one(fd, rec) != 0 || read_one(fd, rec + 8) != 0)
+        return -1;
+    if (rec[0] != LED_RECLEN) {
+        fprintf(stderr, "elfctl: unexpected LED record length 0x%02x (want 0x%02x)\n",
+                rec[0], LED_RECLEN);
+        return -1;
+    }
+    out->effect = rec[1];
+    out->color_mode = rec[2];
+    out->r = rec[3];
+    out->g = rec[4];
+    out->b = rec[5];
+    out->mode = rec[11];
+    out->flashes = rec[12];
+    return 0;
+}
+
 /* Backlight colour the device shows for each active layer. */
 static const char *layer_led(int layer) {
     switch (layer) {
@@ -1007,6 +1068,32 @@ static int cmd_layers(int argc, char **argv) {
     return rc == 0 ? 0 : 1;
 }
 
+/* `light get` — show the stored backlight settings. Read-only by design: the
+ * write opcode (0x62) is documented in docs/PROTOCOL.md but has never been
+ * emitted to a device, so elfctl does not offer a setter yet. */
+static int cmd_light(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[2], "get") != 0) {
+        fprintf(stderr, "elfctl: unknown light subcommand '%s' (only 'get' is supported;\n"
+                        "        writing the backlight is not implemented — see docs/PROTOCOL.md)\n",
+                argv[2]);
+        return 1;
+    }
+    int fd = dev_open();
+    if (fd < 0) return 1;
+    struct led l;
+    int rc = read_led(fd, &l);
+    close(fd);
+    if (rc != 0) { fprintf(stderr, "elfctl: failed reading backlight settings\n"); return 1; }
+
+    printf("effect     %s (%u)\n", led_effect_name(l.effect), l.effect);
+    printf("color      #%02x%02x%02x\n", l.r, l.g, l.b);
+    printf("multicolor %s\n", l.flashes == 1 ? "yes" : "no");
+    printf("colorMode  %u\n", l.color_mode);
+    printf("mode       %u\n", l.mode);
+    printf("(read-only; colorMode/mode semantics are still unknown)\n");
+    return 0;
+}
+
 /* Software equivalent of the physical S button: switch the active layer. */
 static int cmd_switch(const char *arg) {
     int layer = atoi(arg);
@@ -1112,6 +1199,7 @@ static void usage(void) {
         "                              binding may be `macro:N` to run macro slot N\n"
         "  elfctl layers [N]           show enabled layers, or enable N (1..3)\n"
         "  elfctl switch <layer>       switch active layer (software S button)\n"
+        "  elfctl light get            show the backlight settings (read-only)\n"
         "  elfctl macro list           show the macro table\n"
         "  elfctl macro set <id> <name> <seq>   define macro (e.g. 'ctrl-c, 50ms, ctrl-v')\n"
         "  elfctl macro delete <id>    clear a macro slot\n"
@@ -1148,6 +1236,8 @@ int main(int argc, char **argv) {
         return cmd_get(0, argc >= 3 ? atoi(argv[2]) : 0);
     if (strcmp(cmd, "layers") == 0)
         return cmd_layers(argc, argv);
+    if (strcmp(cmd, "light") == 0)
+        return cmd_light(argc, argv);
     if (strcmp(cmd, "switch") == 0) {
         if (argc != 3) { usage(); return 2; }
         return cmd_switch(argv[2]);

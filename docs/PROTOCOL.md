@@ -29,7 +29,12 @@ opcode.
 | `0x20` | firmware-flash | **never emitted by elfctl** |
 | `0x60` | set-model | **never emitted by elfctl** |
 
-`elfctl` only ever emits `0x82`/`0x81`/`0x83`.
+Other opcode families are documented in their own sections below: layers
+(`0xD1`–`0xD4`), macros (`0xC0`–`0xC2`), and LEDs (`0x62`/`0x63`, `0xA3`/`0xA4`).
+
+`elfctl` emits `0x81`/`0x82`/`0x83`, `0xC0`/`0xC1`/`0xC2`, `0xD1`–`0xD4` and the
+read-only `0x63`, and nothing else. The LED **write** opcode `0x62` is
+documented but deliberately not implemented — nothing in this repo emits it.
 
 ## Layers — the "S button"
 
@@ -290,6 +295,223 @@ read a slot first, and a macro can be rewritten or deleted with no effect on key
 bindings or other slots. Linking a key to a macro is a normal `0x81` write and is
 reversible by writing any ordinary binding back.
 
+## LEDs / backlight — the `0x62`/`0x63` and `0xA3`/`0xA4` opcodes
+
+The MK424BT's backlight is configurable: effect, RGB colour and a separate
+"border" LED. This is distinct from the red/green/blue **layer indication**
+described above — the layer colour is firmware-driven, while these settings are
+stored device state.
+
+**(Verification status: the read side (`0x63`) is VERIFIED on hardware** —
+MK424BT firmware V1.1, stable across repeated reads, every hard-coded constant
+landing exactly where the app's source says it should. **The write side
+(`0x62`/`0x63`) has never been emitted**, and the `0xA4` border-LED reply is not
+yet disambiguated — see below. Re-run `ledprobe` (read-only) before acting on
+any of it.)
+
+### Source
+
+The opcodes come from the official ElfKey configurator. Version **3.0.0**
+(macOS build, `ElfKey-3.0.0-mac-x64.dmg` → `Contents/Resources/app.asar` →
+`out/main/index.js`) ships the main process as **plain JavaScript**. The current
+**3.3.5** build compiles it to V8 bytecode (`out/main/index.jsc` + a
+`bytecode-loader.js` shim), so the constants are no longer directly readable
+there — though the bytecode's constant pool still leaks the *names*
+(`readLedCmd`, `setLedCmd`, `setLightModeCmd`, …), which is how 3.0.0 was
+identified as worth fetching. **Use 3.0.0 for protocol work.**
+
+### Which family applies to this device
+
+The app has three mutually-exclusive lighting capability predicates. Their
+bodies decide by model string, and MK424 lands in exactly one:
+
+```js
+hasLed()        { … || this.model.includes("MK424"); }          // ← TRUE for us
+hasLightMode()  { return this.model.includes("MK321U") && this.version < 1.7; }
+hasLightFlash() { return … && !this.hasLed() && … ; }            // excluded by hasLed()
+```
+
+So the MK424BT uses the **`hasLed()`** family — `0x62`/`0x63` plus the border-LED
+pair `0xA3`/`0xA4`. The `setLightModeCmd`/`setLightFlashCmd` constants (also
+`0xA3`, with different payloads) belong to *other* models and must not be used
+here. Note `0x62` sits next to the dangerous `0x60` set-model opcode — be exact.
+
+| Opcode | Name | Send | Meaning |
+|--------|------|------|---------|
+| `0x63` | read-led        | `01 63 <slot> …` | read LED settings; `readLed()` uses slot `1`. **Implemented** as `elfctl light get` |
+| `0x62` | set-led         | `01 62 0D 01 …` + 2 data reports | write LED settings |
+| `0xA4` | read-border-led | `01 A4 00 …` | border-LED mode; reply offset ambiguous, see below |
+| `0xA3` | set-border-led  | `01 A3 04 <mode> …` | set border-LED mode |
+
+`0x63` byte[2] is a **slot index**, not a flag: the app's per-key scheme reader
+loops `readLedCmd[2] = i+1` over the key count, and uses slots 10–12 for the
+sleep-LED scheme. The simple `readLed()` path only ever reads slot 1.
+
+### Write payload (`0x62`)
+
+Header, then two data reports — a single length-prefixed 13-byte record split
+across them, the same style as the macro action records:
+
+```
+header  : 01 62 0D 01 00 00 00 00
+data 1  : 0D <effect> <colorMode> <r> <g> <b> 01 E8
+data 2  : 03 E8 03 <mode> <flashes> 00 00 00
+          → then read one ACK
+```
+
+Concatenated, the record is:
+
+```
+0D <effect> <colorMode> <r> <g> <b> 01 E8 03 E8 03 <mode> <flashes>
+```
+
+`0x0D` = 13 = the record length. The two `E8 03` pairs are **(inferred)** 16-bit
+little-endian `1000` — plausibly timing/period in ms; the app hard-codes them and
+never exposes them, so this is a guess. The `01` before them is unidentified.
+
+The app follows every `setLed` with a border-LED write (`01 A3 04 <mode>`) and a
+second ACK read, so the two settings are always written as a pair. Since the
+border-LED offset is still unresolved (below), a first write experiment should
+send only the `0x62` part and leave `0xA3` alone.
+
+### Implementing the write — read this first
+
+Everything above is decoded, but **nothing on the write path has been observed
+on the wire**. Four things that will bite:
+
+- **The −1 rule is a READ artifact — do NOT apply it to writes.** node-hid
+  prepends a report-ID byte on *reads* only; the app's command arrays are sent
+  verbatim. The write bytes above are already correct as-is. (elfctl's
+  `write_cmd()` prepends the `0x00` report byte the kernel strips, which is the
+  same framing the `0xD2` section documents for this PID.)
+- **Header `byte[4]` is unverified.** `setLedCmd` is a shared mutable array in
+  the app: `setLedScheme()` sets `[4] = keyIndex`, while `setLed()` sets only
+  `[2]` and `[3]` — so whatever `[4]` holds is leftover from an earlier call,
+  and is `0` on a fresh run. Send `0`; don't assume it is meaningful.
+- **The ACK is unknown.** The app does one `read()` after the data reports and
+  ignores the result. We have never seen what comes back, so don't gate success
+  on a particular reply — verify by re-reading with `0x63` instead.
+- **`colorMode` and `mode` must be preserved, not defaulted.** See the enum
+  notes below: the app's `3`/`1` are *fallback placeholders*, not this device's
+  values.
+
+The safe way to attempt it, in order:
+
+1. `elfctl light get` (or `ledprobe`) and **write the record down**.
+2. Emit `0x62` with the byte-identical record. Nothing should visibly change.
+3. Re-read. If it round-trips unchanged, the write framing is correct.
+4. Only then change one field (`effect` is the safest — it is the one the app's
+   own UI exposes), re-read to confirm, and restore.
+
+**Known-good record for this device** (factory state, MK424BT V1.1) — restore by
+writing exactly this back:
+
+```
+header : 01 62 0D 01 00 00 00 00
+data 1 : 0d 03 02 00 ff 00 01 e8
+data 2 : 03 e8 03 02 01 00 00 00
+```
+
+The write is recoverable in the sense that it is a plain settings overwrite —
+it touches no key binding, macro or layer state, and the record above restores
+it. It is not a firmware operation.
+
+### Read payload (`0x63`) — verified
+
+The device replies with **exactly the record it accepts on write**, same two
+reports, no shift:
+
+```
+report 0 : 0D <effect> <colorMode> <r> <g> <b> 01 E8
+report 1 : 03 E8 03 <mode> <flashes> 00 00 00
+```
+
+Observed on an MK424BT (stable across repeated reads):
+
+```
+report 0: 0d 03 02 00 ff 00 01 e8
+report 1: 03 e8 03 02 01 00 00 00
+→ effect=3 (breathing)  colorMode=2  color=#00ff00  mode=2  flashes=1
+  byte[6]=1  timings=1000,1000
+```
+
+Both `E8 03` pairs decode to exactly **1000** as 16-bit little-endian,
+confirming that reading (they are still hard-coded by the app and their meaning
+is unconfirmed — plausibly a period in ms). `byte[6]` is `1`, matching the
+constant the app writes.
+
+#### The off-by-one against the app's source (important)
+
+The app's `readLed()` takes `effect` from `data1[2]`, `colorMode` from
+`data1[3]`, RGB from `data1[4..6]`, `mode` from `data2[4]` and `flashes` from
+`data2[5]` — **every one of those is one higher than the offsets above**.
+node-hid hands the app a leading report-ID byte, which the kernel strips from
+`hidraw` reads. So:
+
+> **app read index N == our index N−1.** Translate every read offset from the
+> configurator's source by −1 before using it here.
+
+Getting this wrong is not a crash, it is a *plausible-looking* misparse: the
+naive reading of the same bytes yields `effect=2`, `colorMode=0` and
+`color=#ff0001` — all valid-looking values, and all wrong. The giveaway is the
+leading `0x0D` length byte and the `01 E8 03 E8 03` constant run, which only
+line up under the correct alignment.
+
+### Border LED (`0xA4`) — unresolved
+
+The reply echoes the opcode in `byte[0]`, like the `0xD3` family:
+
+```
+a4 82 03 00 00 00 00 00
+```
+
+Applying the −1 rule to the app's `borderLedData[2]` gives **`byte[1]` = 0x82 =
+130 = "colorful breath"**. But `byte[2]` = 3 is *also* a valid enum member
+("flashes when key is pressed"), so the two candidates cannot be told apart from
+one sample. Do not implement border-LED support until this is settled — e.g. by
+changing the setting in the official app and re-reading, or by a usbmon capture.
+
+A first read after another command returned `a4 82 00 32 34 42 54 5f`, whose
+tail is ASCII `24BT_` — stale model-string bytes left in the reply buffer. The
+trailing bytes of a short reply are **not** zeroed reliably; drain before
+reading and ignore anything past the documented fields.
+
+### Enum values
+
+From the configurator's own UI (English strings quoted verbatim):
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `effect` | 1 | "Turn off the light" |
+| | 2 | "Corresponding key pressed blinks" |
+| | 3 | "Breathing light mode" |
+| | 5 | "Flashes" |
+| `flashes` | 1 | "Multicolor (high power consumption)" |
+| | 0 | single colour (use `color`) |
+| `borderLed` | 0 | off |
+| | 1 | "Always on (high power consumption)" |
+| | 2 | breathing |
+| | 3 | "Flashes when key is pressed" |
+| | 130 | "Colorful breath" |
+
+`color` is plain 24-bit RGB (`r`,`g`,`b` bytes). `colorMode` and `mode` are read
+and written back **unchanged** by the app — its UI never edits them, so their
+semantics are **unknown**. Always preserve whatever the device reports.
+
+The `colorMode: 3` / `mode: 1` values in the app's source are the **fallback
+placeholders** it uses when a read fails, *not* device defaults — this MK424BT
+reports `colorMode=2, mode=2`. Writing 3/1 because the app's source shows them
+would clobber real state.
+
+### What this does *not* explain
+
+The **charging marquee** (a red running light while charging over USB, per the
+MK424 manual) and the full-charge breathing indicator are firmware status
+behaviours tied to power state. Nothing in the `hasLed()` path selects them, and
+the app exposes no control for them. Treat them as **not configurable** unless
+evidence turns up otherwise — a marquee appearing on USB is the charger
+indicator, not a setting that got changed.
+
 ## Diagnostic tools (this directory)
 
 These `.c` files live alongside this doc as reverse-engineering artifacts. Build
@@ -314,6 +536,11 @@ firmware-flash/set-model.
   reports plus a decode of name / mode / each action (mod, key, type, delay). Used
   to confirm the `0xC0`-family framing and pin down the `type`/`mode` enum values
   before they were folded into `elfctl`'s `macro` commands.
+- `ledprobe.c` — **read-only** dump of the LED settings via `0x63` (key LED) and
+  `0xA4` (border LED): prints the raw reports plus a decode of
+  effect / colour / mode / flashes. Confirmed the `0x63` record on hardware and
+  exposed the −1 read-offset rule; the `0xA4` border-LED offset is still open.
+  See [LEDs / backlight](#leds--backlight--the-0x620x63-and-0xa30xa4-opcodes).
 
 The `0xD1`–`0xD4` opcodes are documented in the official configurator's source,
 so emitting them is not a blind fuzz. `0xD2`/`0xD4` change state but are

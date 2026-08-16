@@ -4,7 +4,7 @@ PREFIX  ?= /usr/local
 BINDIR   = $(PREFIX)/bin
 
 BIN      = elfctl
-EXTRA    = probe experiment readsweep layerprobe listen layerwrite layerctl macroprobe
+EXTRA    = probe experiment readsweep layerprobe listen layerwrite layerctl macroprobe ledprobe
 
 .PHONY: all help clean install uninstall install-udev diag
 
